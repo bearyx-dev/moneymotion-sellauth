@@ -227,7 +227,7 @@ const server = http.createServer(async (req, res) => {
     send(res, 404, { error: "Not found" });
   } catch (err) {
     console.error("[server] Error:", err.message);
-    send(res, 500, { error: "Internal server error" });
+    send(res, 500, { error: err.message });
   }
 });
 
