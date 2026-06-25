@@ -13,13 +13,21 @@ const {
   MONEYMOTION_WEBHOOK_SECRET,
   SELLAUTH_API_KEY,
   SELLAUTH_SHOP_ID,
-  DOMAIN,
   SANDBOX,
 } = process.env;
+
+// Strip trailing slash so DOMAIN never produces //path double-slashes
+const DOMAIN = (process.env.DOMAIN || "").replace(/\/+$/, "");
+// Optional: where to send the customer if they cancel. Falls back to DOMAIN.
+const STORE_URL = (process.env.STORE_URL || DOMAIN).replace(/\/+$/, "");
 
 const MM_BASE = SANDBOX === "true"
   ? "https://api.sandbox.moneymotion.io"
   : "https://api.moneymotion.io";
+
+const MM_CHECKOUT_HOST = SANDBOX === "true"
+  ? "https://sandbox.moneymotion.io"
+  : "https://moneymotion.io";
 
 const SA_BASE = "https://api.sellauth.com/v1";
 
@@ -102,15 +110,12 @@ function moneyMotionRpc(tag, payload, extraHeaders = {}) {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => {
-        // Parse NDJSON — find the Exit message
         const lines = data.split("\n").filter((l) => l.trim());
         for (const line of lines) {
           let msg;
           try { msg = JSON.parse(line); } catch { continue; }
           if (msg._tag === "Exit" && msg.exit) {
-            if (msg.exit._tag === "Success") {
-              return resolve(msg.exit.value);
-            }
+            if (msg.exit._tag === "Success") return resolve(msg.exit.value);
             if (msg.exit._tag === "Failure") {
               const cause = msg.exit.cause;
               const text = cause?.error?.message
@@ -122,7 +127,6 @@ function moneyMotionRpc(tag, payload, extraHeaders = {}) {
             return reject(new Error(`MoneyMotion RPC ${tag} defect: ${JSON.stringify(msg)}`));
           }
         }
-        // If no Exit found and status is bad, surface body
         if (res.statusCode >= 400) {
           return reject(new Error(`MoneyMotion HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
         }
@@ -133,6 +137,52 @@ function moneyMotionRpc(tag, payload, extraHeaders = {}) {
     req.write(envelope);
     req.end();
   });
+}
+
+// ─── Checkout session creator ────────────────────────────────────────────────────
+async function createCheckoutSession(invoiceId) {
+  const invoice = await sellAuth("GET", `/invoices/${invoiceId}`);
+  console.log(`[pay] Invoice: ${JSON.stringify(invoice)}`);
+
+  const priceUsd = invoice.price_usd ?? invoice.price ?? invoice.total_price_usd ?? invoice.total ?? null;
+  if (priceUsd === null) throw new Error("Could not determine invoice price from SellAuth response.");
+
+  const totalInCents = Math.round(parseFloat(priceUsd) * 100);
+  const currency = invoice.currency ?? "USD";
+  const email = invoice.email ?? invoice.customer_email ?? invoice.buyer_email ?? "customer@unknown.com";
+  const productName = invoice.product_title ?? invoice.product?.title ?? invoice.title ?? `Order ${invoiceId}`;
+
+  console.log(`[pay] Amount: $${priceUsd} (${currency}) → ${totalInCents} cents | email: ${email}`);
+
+  const sessionValue = await moneyMotionRpc(
+    "CheckoutSessionsCreateCheckoutSession",
+    {
+      description: productName,
+      urls: {
+        success: `${DOMAIN}/payment-complete?status=success&invoice=${invoiceId}`,
+        cancel:  STORE_URL || `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
+        failure: `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
+      },
+      userInfo: { email },
+      lineItems: [
+        {
+          name: productName,
+          description: `SellAuth invoice ${invoiceId}`,
+          pricePerItemInCents: totalInCents,
+          quantity: 1,
+        },
+      ],
+      metadata: { invoiceId, sellAuthShopId: SELLAUTH_SHOP_ID },
+    },
+    { "x-currency": currency }
+  );
+
+  console.log(`[pay] MM session: ${JSON.stringify(sessionValue)}`);
+
+  const sessionId = sessionValue?.checkoutSessionId;
+  if (!sessionId) throw new Error(`MoneyMotion did not return a checkoutSessionId. Response: ${JSON.stringify(sessionValue)}`);
+
+  return `${MM_CHECKOUT_HOST}/checkout/${sessionId}`;
 }
 
 // ─── Webhook verification ────────────────────────────────────────────────────────
@@ -171,9 +221,13 @@ function readBody(req) {
 }
 
 // ─── Pages ───────────────────────────────────────────────────────────────────────
+function loadingPage(invoiceId) {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Redirecting to checkout…</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh}@keyframes spin{to{transform:rotate(360deg)}}.spinner{width:48px;height:48px;border:4px solid #ffffff18;border-top-color:#22d3ee;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 1.5rem}.card{text-align:center}.title{font-size:1.25rem;font-weight:600;margin-bottom:.5rem;color:#fff}.sub{color:#71717a;font-size:.875rem}</style></head><body><div class="card"><div class="spinner"></div><div class="title">Preparing your checkout…</div><div class="sub">You'll be redirected in a moment.</div></div><script>fetch('/pay-redirect/${invoiceId}').then(r=>r.json()).then(d=>{if(d.url){window.location.href=d.url;}else{document.querySelector('.title').textContent='Something went wrong';document.querySelector('.sub').textContent=d.error||'Please go back and try again.';document.querySelector('.spinner').style.display='none';}}).catch(()=>{document.querySelector('.title').textContent='Something went wrong';document.querySelector('.sub').textContent='Please go back and try again.';document.querySelector('.spinner').style.display='none';});</script></body></html>`;
+}
+
 const PAGE = {
-  success: (invoice) => `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Successful</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem}.card{background:#13131a;border:1px solid #ffffff18;border-radius:16px;padding:2.5rem;text-align:center;max-width:420px;width:100%}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.5rem;font-weight:700;margin-bottom:.5rem;color:#4ade80}p{color:#a1a1aa;line-height:1.6;margin-bottom:1rem}small{color:#52525b;font-size:.75rem}</style></head><body><div class="card"><div class="icon">✅</div><h1>Payment Successful</h1><p>Your payment was confirmed. Check your email for delivery — it should arrive within a few minutes.</p><p>If you don't receive anything, contact support with your order reference.</p><small>Order ref: ${invoice}</small></div></body></html>`,
-  cancelled: () => `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Cancelled</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem}.card{background:#13131a;border:1px solid #ffffff18;border-radius:16px;padding:2.5rem;text-align:center;max-width:420px;width:100%}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.5rem;font-weight:700;margin-bottom:.5rem;color:#f87171}p{color:#a1a1aa;line-height:1.6}</style></head><body><div class="card"><div class="icon">❌</div><h1>Payment Cancelled</h1><p>Your payment was not completed. Go back to the store and try again.</p></div></body></html>`,
+  success: (invoice) => `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Successful</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem}.card{background:#13131a;border:1px solid #ffffff18;border-radius:16px;padding:2.5rem;text-align:center;max-width:420px;width:100%}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.5rem;font-weight:700;margin-bottom:.5rem;color:#4ade80}p{color:#a1a1aa;line-height:1.6;margin-bottom:1rem}small{color:#52525b;font-size:.75rem;display:block;margin-bottom:1.5rem}a.btn{display:inline-block;background:#22d3ee;color:#020617;font-weight:700;padding:.625rem 1.5rem;border-radius:8px;text-decoration:none;font-size:.9rem}a.btn:hover{background:#67e8f9}</style></head><body><div class="card"><div class="icon">✅</div><h1>Payment Successful</h1><p>Your payment was confirmed. Check your email for delivery — it should arrive within a few minutes.</p><small>Order ref: ${invoice}</small>${STORE_URL ? `<a class="btn" href="${STORE_URL}">Back to store</a>` : ""}</div></body></html>`,
+  cancelled: () => `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment Cancelled</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem}.card{background:#13131a;border:1px solid #ffffff18;border-radius:16px;padding:2.5rem;text-align:center;max-width:420px;width:100%}.icon{font-size:3rem;margin-bottom:1rem}h1{font-size:1.5rem;font-weight:700;margin-bottom:.5rem;color:#f87171}p{color:#a1a1aa;line-height:1.6;margin-bottom:1.5rem}a.btn{display:inline-block;background:#22d3ee;color:#020617;font-weight:700;padding:.625rem 1.5rem;border-radius:8px;text-decoration:none;font-size:.9rem}a.btn:hover{background:#67e8f9}</style></head><body><div class="card"><div class="icon">❌</div><h1>Payment Cancelled</h1><p>Your payment was not completed.</p>${STORE_URL ? `<a class="btn" href="${STORE_URL}">Back to store</a>` : ""}</div></body></html>`,
 };
 
 // ─── Server ───────────────────────────────────────────────────────────────────────
@@ -193,72 +247,36 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // Payment entry point — SellAuth redirects here
+    // Step 1: SellAuth redirects here — respond with loading page IMMEDIATELY
     const payMatch = path.match(/^\/pay\/(.+)$/);
     if (payMatch && method === "GET") {
       const invoiceId = payMatch[1];
-      console.log(`[pay] Invoice: ${invoiceId}`);
+      console.log(`[pay] Loading page for invoice: ${invoiceId}`);
+      return send(res, 200, loadingPage(invoiceId));
+    }
 
-      const invoice = await sellAuth("GET", `/invoices/${invoiceId}`);
-      console.log(`[pay] Invoice data:`, JSON.stringify(invoice));
-
-      const priceUsd = invoice.price_usd ?? invoice.price ?? invoice.total_price_usd ?? invoice.total ?? null;
-      if (priceUsd === null) {
-        console.error("[pay] Cannot determine price:", invoice);
-        return send(res, 500, "Could not determine invoice price.");
-      }
-
-      const totalInCents = Math.round(parseFloat(priceUsd) * 100);
-      const currency = invoice.currency ?? "USD";
-      const email = invoice.email ?? invoice.customer_email ?? invoice.buyer_email ?? "customer@unknown.com";
-      const productName = invoice.product_title ?? invoice.product?.title ?? invoice.title ?? `Order ${invoiceId}`;
-      console.log(`[pay] Amount: $${priceUsd} (${currency}) → ${totalInCents} cents | email: ${email}`);
-
-      const sessionValue = await moneyMotionRpc(
-        "CheckoutSessionsCreateCheckoutSession",
-        {
-          description: productName,
-          urls: {
-            success: `${DOMAIN}/payment-complete?status=success&invoice=${invoiceId}`,
-            cancel:  `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
-            failure: `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
-          },
-          userInfo: { email },
-          lineItems: [
-            {
-              name: productName,
-              description: `SellAuth invoice ${invoiceId}`,
-              pricePerItemInCents: totalInCents,
-              quantity: 1,
-            },
-          ],
-          metadata: { invoiceId, sellAuthShopId: SELLAUTH_SHOP_ID },
-        },
-        { "x-currency": currency }
-      );
-      console.log(`[pay] MM session value:`, JSON.stringify(sessionValue));
-
-      const sessionId = sessionValue?.checkoutSessionId;
-      if (!sessionId) {
-        console.error("[pay] No checkoutSessionId in response:", sessionValue);
-        return send(res, 500, "MoneyMotion did not return a session ID.");
-      }
-
-      const checkoutHost = SANDBOX === "true" ? "https://sandbox.moneymotion.io" : "https://moneymotion.io";
-      return redirect(res, `${checkoutHost}/checkout/${sessionId}`);
+    // Step 2: Loading page fetches this — does the API work, returns JSON
+    const payRedirectMatch = path.match(/^\/pay-redirect\/(.+)$/);
+    if (payRedirectMatch && method === "GET") {
+      const invoiceId = payRedirectMatch[1];
+      console.log(`[pay-redirect] Creating session for invoice: ${invoiceId}`);
+      const checkoutUrl = await createCheckoutSession(invoiceId);
+      return send(res, 200, { url: checkoutUrl });
     }
 
     // Webhook — MoneyMotion posts here on payment events
     if (path === "/moneymotion-webhook" && method === "POST") {
       const rawBody = await readBody(req);
-      const sig = req.headers["x-moneymotion-signature"]
-        ?? req.headers["x-webhook-signature"]
+
+      // Signature header per MoneyMotion's actual header names
+      const sig = req.headers["x-webhook-signature"]
         ?? req.headers["x-signature"]
+        ?? req.headers["x-moneymotion-signature"]
         ?? "";
 
       const valid = await verifySignature(rawBody, sig);
       if (!valid) {
-        console.warn("[webhook] Bad signature");
+        console.warn("[webhook] Bad signature, header:", sig ? sig.slice(0, 20) + "..." : "(missing)");
         return send(res, 401, { error: "Invalid signature" });
       }
 
@@ -270,14 +288,21 @@ const server = http.createServer(async (req, res) => {
       }
 
       const session = event.checkoutSession;
-      if (!session || session.status !== "completed") {
+      if (!session) {
+        console.error("[webhook] No checkoutSession in payload");
+        return send(res, 400, { error: "Missing checkoutSession" });
+      }
+
+      // status is "completed" per MoneyMotion's actual webhook shape
+      if (session.status !== "completed") {
+        console.log(`[webhook] Session status is "${session.status}", skipping`);
         return send(res, 200, { received: true });
       }
 
       const invoiceId = session.metadata?.invoiceId;
       if (!invoiceId) {
         console.error("[webhook] No invoiceId in metadata:", session.metadata);
-        return send(res, 400, { error: "Missing invoiceId" });
+        return send(res, 400, { error: "Missing invoiceId in metadata" });
       }
 
       console.log(`[webhook] Completing SellAuth invoice: ${invoiceId}`);
@@ -286,6 +311,7 @@ const server = http.createServer(async (req, res) => {
         console.log(`[webhook] ✅ Invoice ${invoiceId} completed`);
       } catch (err) {
         console.error(`[webhook] SellAuth complete failed:`, err.message);
+        // Still return 200 so MoneyMotion doesn't keep retrying
       }
 
       return send(res, 200, { received: true });
@@ -296,8 +322,7 @@ const server = http.createServer(async (req, res) => {
       const status = parsed.query.status ?? "unknown";
       const invoice = parsed.query.invoice ?? "";
       if (status === "success") return send(res, 200, PAGE.success(invoice));
-      if (status === "cancelled") return send(res, 200, PAGE.cancelled());
-      return send(res, 200, "<html><body style='background:#0a0a0f;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh'><h1>Processing…</h1></body></html>");
+      return send(res, 200, PAGE.cancelled());
     }
 
     send(res, 404, { error: "Not found" });
@@ -311,5 +336,6 @@ validateEnv();
 server.listen(PORT, () => {
   console.log(`\n🚀 MoneyMotion × SellAuth bridge running on port ${PORT}`);
   console.log(`   Sandbox: ${SANDBOX === "true" ? "YES" : "NO"}`);
-  console.log(`   Domain:  ${DOMAIN}\n`);
+  console.log(`   Domain:  ${DOMAIN}`);
+  console.log(`   Store:   ${STORE_URL || "(not set)"}\n`);
 });
