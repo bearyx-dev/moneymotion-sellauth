@@ -4,7 +4,7 @@
   "description": "MoneyMotion × SellAuth payment bridge — self-hosted",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "npm install && node server.js",
     "dev": "node --watch server.js"
   },
   "engines": {
