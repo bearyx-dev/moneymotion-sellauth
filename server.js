@@ -155,7 +155,7 @@ const server = http.createServer(async (req, res) => {
       const totalInCents = Math.round(parseFloat(priceUsd) * 100);
       console.log(`[pay] Amount: $${priceUsd} → ${totalInCents} cents`);
 
-      const session = await moneyMotion("POST", "/createCheckoutSession", {
+      const session = await moneyMotion("POST", "/checkoutSession.create", {
         totalInCents,
         metadata: { invoiceId, sellAuthShopId: SELLAUTH_SHOP_ID },
         successUrl: `${DOMAIN}/payment-complete?status=success&invoice=${invoiceId}`,
