@@ -1,17 +1,14 @@
 {
   "name": "moneymotion-sellauth",
   "version": "1.0.0",
-  "description": "MoneyMotion × SellAuth payment bridge — self-hosted",
+  "description": "MoneyMotion x SellAuth payment bridge",
   "main": "server.js",
   "scripts": {
-    "start": "npm install && node server.js",
+    "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "engines": {
     "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "express": "^4.22.2"
   },
   "license": "MIT"
 }
