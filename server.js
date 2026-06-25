@@ -73,10 +73,66 @@ function sellAuth(method, path, body) {
   }, body);
 }
 
-function moneyMotion(method, path, body) {
-  return request(method, `${MM_BASE}${path}`, {
-    "X-API-Key": MONEYMOTION_API_KEY,
-  }, body);
+// Effect RPC over NDJSON — MoneyMotion's real wire format
+function moneyMotionRpc(tag, payload, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const envelope = JSON.stringify({
+      _tag: "Request",
+      id: "0",
+      tag,
+      payload,
+      headers: [],
+    }) + "\n";
+
+    const parsed = new URL(`${MM_BASE}/rpc`);
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: "/rpc",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/ndjson",
+        "Accept": "application/ndjson",
+        "x-api-key": MONEYMOTION_API_KEY,
+        ...extraHeaders,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        // Parse NDJSON — find the Exit message
+        const lines = data.split("\n").filter((l) => l.trim());
+        for (const line of lines) {
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (msg._tag === "Exit" && msg.exit) {
+            if (msg.exit._tag === "Success") {
+              return resolve(msg.exit.value);
+            }
+            if (msg.exit._tag === "Failure") {
+              const cause = msg.exit.cause;
+              const text = cause?.error?.message
+                ?? (typeof cause === "string" ? cause : JSON.stringify(cause));
+              return reject(new Error(`MoneyMotion RPC ${tag} failed: ${text}`));
+            }
+          }
+          if (msg._tag === "Defect") {
+            return reject(new Error(`MoneyMotion RPC ${tag} defect: ${JSON.stringify(msg)}`));
+          }
+        }
+        // If no Exit found and status is bad, surface body
+        if (res.statusCode >= 400) {
+          return reject(new Error(`MoneyMotion HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+        }
+        reject(new Error(`MoneyMotion RPC ${tag}: no Exit in response. Body: ${data.slice(0, 300)}`));
+      });
+    });
+    req.on("error", reject);
+    req.write(envelope);
+    req.end();
+  });
 }
 
 // ─── Webhook verification ────────────────────────────────────────────────────────
@@ -149,27 +205,47 @@ const server = http.createServer(async (req, res) => {
       const priceUsd = invoice.price_usd ?? invoice.price ?? invoice.total_price_usd ?? invoice.total ?? null;
       if (priceUsd === null) {
         console.error("[pay] Cannot determine price:", invoice);
-        return send(res, 500, "text/plain: Could not determine invoice price.");
+        return send(res, 500, "Could not determine invoice price.");
       }
 
       const totalInCents = Math.round(parseFloat(priceUsd) * 100);
-      console.log(`[pay] Amount: $${priceUsd} → ${totalInCents} cents`);
+      const currency = invoice.currency ?? "USD";
+      const email = invoice.email ?? invoice.customer_email ?? invoice.buyer_email ?? "customer@unknown.com";
+      const productName = invoice.product_title ?? invoice.product?.title ?? invoice.title ?? `Order ${invoiceId}`;
+      console.log(`[pay] Amount: $${priceUsd} (${currency}) → ${totalInCents} cents | email: ${email}`);
 
-      const session = await moneyMotion("POST", "/checkoutSession.create", {
-        totalInCents,
-        metadata: { invoiceId, sellAuthShopId: SELLAUTH_SHOP_ID },
-        successUrl: `${DOMAIN}/payment-complete?status=success&invoice=${invoiceId}`,
-        cancelUrl: `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
-      });
-      console.log(`[pay] MM session:`, JSON.stringify(session));
+      const sessionValue = await moneyMotionRpc(
+        "CheckoutSessionsCreateCheckoutSession",
+        {
+          description: productName,
+          urls: {
+            success: `${DOMAIN}/payment-complete?status=success&invoice=${invoiceId}`,
+            cancel:  `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
+            failure: `${DOMAIN}/payment-complete?status=cancelled&invoice=${invoiceId}`,
+          },
+          userInfo: { email },
+          lineItems: [
+            {
+              name: productName,
+              description: `SellAuth invoice ${invoiceId}`,
+              pricePerItemInCents: totalInCents,
+              quantity: 1,
+            },
+          ],
+          metadata: { invoiceId, sellAuthShopId: SELLAUTH_SHOP_ID },
+        },
+        { "x-currency": currency }
+      );
+      console.log(`[pay] MM session value:`, JSON.stringify(sessionValue));
 
-      const redirectUrl = session.url ?? session.checkoutUrl ?? session.redirect_url;
-      if (!redirectUrl) {
-        console.error("[pay] No checkout URL in response:", session);
-        return send(res, 500, "MoneyMotion did not return a checkout URL.");
+      const sessionId = sessionValue?.checkoutSessionId;
+      if (!sessionId) {
+        console.error("[pay] No checkoutSessionId in response:", sessionValue);
+        return send(res, 500, "MoneyMotion did not return a session ID.");
       }
 
-      return redirect(res, redirectUrl);
+      const checkoutHost = SANDBOX === "true" ? "https://sandbox.moneymotion.io" : "https://moneymotion.io";
+      return redirect(res, `${checkoutHost}/checkout/${sessionId}`);
     }
 
     // Webhook — MoneyMotion posts here on payment events
